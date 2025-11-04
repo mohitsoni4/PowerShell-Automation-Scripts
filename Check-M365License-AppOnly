@@ -1,0 +1,91 @@
+# =======================================
+# Send-M365LicenseChangeEmail.ps1
+# Detects changes in M365 licence assignments and emails report
+# =======================================
+
+# --- CONFIGURATION ---
+$AdminEmail   = "<ADMIN_EMAIL>"
+$NotifyTo     = "<NOTIFY_TO_EMAIL>"
+$ClientId     = "<CLIENT_ID>"
+$TenantId     = "<TENANT_ID>"
+$ClientSecret = "<CLIENT_SECRET>"
+
+$CsvPath_Current = "C:\Scripts\M365_License_Current.csv"
+$CsvPath_Last    = "C:\Scripts\M365_License_Last.csv"
+
+# --- LOAD MODULES ---
+Import-Module Microsoft.Graph.Users -ErrorAction SilentlyContinue
+Import-Module Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
+
+# --- CONNECT TO GRAPH ---
+$SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$Credential   = New-Object System.Management.Automation.PSCredential ($ClientId, $SecureSecret)
+Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $Credential | Out-Null
+
+# --- GET USER LICENCE DATA ---
+$Users = Get-MgUser -All -Property DisplayName,UserPrincipalName,AssignedLicenses |
+    Select-Object DisplayName, UserPrincipalName,
+        @{Name="LicenseCount"; Expression={($_.AssignedLicenses | Measure-Object).Count}}
+
+$Users | Export-Csv -Path $CsvPath_Current -NoTypeInformation
+
+# --- IF LAST FILE EXISTS, COMPARE CHANGES ---
+if (Test-Path $CsvPath_Last) {
+    $OldData = Import-Csv $CsvPath_Last
+    $NewData = Import-Csv $CsvPath_Current
+
+    # Find added or removed licences
+    $AddedLic = Compare-Object -ReferenceObject $OldData -DifferenceObject $NewData -Property UserPrincipalName, LicenseCount |
+        Where-Object { $_.SideIndicator -eq '=>' -and $_.LicenseCount -gt 0 }
+
+    $RemovedLic = Compare-Object -ReferenceObject $OldData -DifferenceObject $NewData -Property UserPrincipalName, LicenseCount |
+        Where-Object { $_.SideIndicator -eq '<=' -and $_.LicenseCount -eq 0 }
+
+    if ($AddedLic -or $RemovedLic) {
+        # --- GET LICENCE POOL SUMMARY ---
+        $SkuSummary = Get-MgSubscribedSku | Select SkuPartNumber, ConsumedUnits,
+            @{Name='Available';Expression={$_.PrepaidUnits.Enabled - $_.ConsumedUnits}}
+
+        # --- BUILD HTML BODY ---
+        $AddedSection   = if ($AddedLic) { "<h3>New Licence Assignments:</h3><pre>$($AddedLic | Out-String)</pre>" } else { "" }
+        $RemovedSection = if ($RemovedLic) { "<h3>Licences Removed:</h3><pre>$($RemovedLic | Out-String)</pre>" } else { "" }
+
+        $BodyContent = @"
+<h2>Microsoft 365 Licence Assignment Update</h2>
+$AddedSection
+$RemovedSection
+<hr>
+<h3>Current Licence Pool</h3>
+<pre>$($SkuSummary | Out-String)</pre>
+"@
+
+        # --- SEND EMAIL ---
+        $msgBody = @{
+            Message = @{
+                Subject = "M365 Licence Change Detected"
+                Body = @{
+                    ContentType = "HTML"
+                    Content     = $BodyContent
+                }
+                ToRecipients = @(@{ EmailAddress = @{ Address = $NotifyTo } })
+            }
+            SaveToSentItems = $true
+        }
+
+        Send-MgUserMail -UserId $AdminEmail -BodyParameter $msgBody
+        Write-Host "Email sent to $NotifyTo (changes detected)."
+    }
+    else {
+        Write-Host "No licence changes detected. No email sent."
+    }
+}
+else {
+    Write-Host "No previous data found. This is the first run, baseline file created."
+}
+
+# --- UPDATE LAST SNAPSHOT ---
+Copy-Item $CsvPath_Current $CsvPath_Last -Force
+
+# --- DISCONNECT ---
+Disconnect-MgGraph | Out-Null
